@@ -4,7 +4,9 @@ This project integrates a custom trained YOLO model into ROS 2 for real time obj
 
 The main goal of this system is to provide a complete perception pipeline that can be used for autonomous driving research, simulation, and robotics projects.
 
-[![Watch the Demo Video](./assets/demo_ss.png)](https://drive.google.com/file/d/1xgzN1hMIn3-2maedNHSTKO0GwaCegOs0/view?usp=drive_link)
+[![Project Demo](./assets/demo_ss.png)](https://drive.google.com/file/d/1xgzN1hMIn3-2maedNHSTKO0GwaCegOs0/view?usp=drive_link)
+
+▶️ **[Click here to watch the full demo video]**
 
 ## Key Features
 - ROS 2 lifecycle based YOLO detection node
