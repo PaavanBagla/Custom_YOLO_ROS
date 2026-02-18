@@ -427,7 +427,7 @@ class YoloNode(LifecycleNode):
 
         return keypoints_list
 
-    #######################################################################################
+    ###################################### MODIFIED ######################################
     def classify_traffic_light(self, roi):
         if roi.size == 0:
             return "Unknown"
@@ -510,54 +510,69 @@ class YoloNode(LifecycleNode):
             if results.keypoints:
                 keypoints = self.parse_keypoints(results)
 
-            #######################################################################################
-            # Store traffic light colors by detection index
+            ###################################### MODIFIED ######################################
+            # Dictionary to store detected traffic light colors
+            # Key   -> detection index
+            # Value -> classified color (Red, Yellow, Green, Unknown)
             traffic_colors = {}
 
+            # Only attempt classification if bounding boxes exist
             if results.boxes:
-                h, w, _ = cv_image.shape
-
+                h, w, _ = cv_image.shape # Get image height and width for boundary checks
+                
+                # Loop through all detected bounding boxes
                 for i, box_data in enumerate(results.boxes):
+                    # Extract class ID and corresponding class name
                     cls_id = int(box_data.cls)
                     class_name = self.yolo.names[cls_id]
 
+                    # Only perform color classification for traffic lights
                     if class_name == "traffic light":
-
+                        
+                        # Extract bounding box coordinates (top left and bottom right corners)
                         x1, y1, x2, y2 = map(int, box_data.xyxy[0])
 
+                        # Compute bounding box center
                         cx = (x1 + x2) // 2
                         cy = (y1 + y2) // 2
+                        # Compute bounding box width and height
                         bw = x2 - x1
                         bh = y2 - y1
 
-                        scale = 1.6   # try 1.4, 1.6, 1.8
-
+                        # Scale factor to enlarge the bounding box
+                        # This helps capture more color pixels, especially for far traffic lights
+                        scale = 1.6  
                         new_w = int(bw * scale)
                         new_h = int(bh * scale)
 
+                        # Recompute expanded bounding box centered at original center
                         x1 = cx - new_w // 2
                         x2 = cx + new_w // 2
                         y1 = cy - new_h // 2
                         y2 = cy + new_h // 2
 
-                        # Clamp to image bounds
+                        # Clamp bounding box to stay inside image boundaries
                         x1 = max(0, min(w - 1, x1))
                         x2 = max(0, min(w - 1, x2))
                         y1 = max(0, min(h - 1, y1))
                         y2 = max(0, min(h - 1, y2))
 
-                        # Skip tiny boxes
+                        # Skip extremely small boxes since they do not contain enough color info
                         if (x2 - x1) < 8 or (y2 - y1) < 8:
                             continue
-
+                        
+                        # Extract region of interest corresponding to traffic light
                         roi = cv_image[y1:y2, x1:x2]
+                        # Upscale ROI to improve pixel resolution for HSV thresholding
                         roi = cv2.resize(roi, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+                        # Classify traffic light color using HSV-based filtering
                         color = self.classify_traffic_light(roi)
 
+                        # Store detected color for this bounding box index
                         traffic_colors[i] = color
 
+                        # Terminal Logging for debugging
                         h_roi, w_roi, _ = roi.shape
-
                         self.get_logger().info(
                             f"[TL #{i}] box=({x1},{y1},{x2},{y2}) size=({w_roi}x{h_roi}) "
                             f"color={color}"

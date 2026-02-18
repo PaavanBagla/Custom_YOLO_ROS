@@ -202,7 +202,7 @@ class DebugNode(LifecycleNode):
         box_msg: BoundingBox2D = detection.bbox
         track_id = detection.id
 
-        #######################################################################################
+        ###################################### MODIFIED ######################################
         # Ensure minimum size for visibility
         min_size = 15
         size_x = max(box_msg.size.x, min_size)
@@ -217,7 +217,7 @@ class DebugNode(LifecycleNode):
             round(box_msg.center.position.x + size_x / 2.0),
             round(box_msg.center.position.y + size_y / 2.0),
         )
-        #######################################################################################
+        ######################################################################################
 
         # Define the four corners of the rectangle
         rect_pts = np.array(
@@ -248,7 +248,7 @@ class DebugNode(LifecycleNode):
         # Write text
         label = f"{class_name}"
 
-        #######################################################################################
+        ###################################### MODIFIED ######################################
         # Append traffic light color if present
         if detection.extra_info:
             label = f"{detection.extra_info} Light"
@@ -256,6 +256,8 @@ class DebugNode(LifecycleNode):
 
         label += f" ({track_id})" if track_id else ""
         label += " ({:.3f})".format(score)
+
+        ###################################### MODIFIED ######################################
         # --- Interleaved Alternating Logic with Type Casting ---
         # Default to placing above
         text_y = max(min_pt[1] - 8, 20)
@@ -278,6 +280,7 @@ class DebugNode(LifecycleNode):
         elif "Green" in label: label_color = (0, 255, 0)
         elif "Yellow" in label: label_color = (0, 255, 255)
         cv2.putText(cv_image, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.5, label_color, 2, cv2.LINE_AA)
+        #######################################################################################
 
         return cv_image
 
