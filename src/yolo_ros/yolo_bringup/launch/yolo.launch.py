@@ -214,6 +214,13 @@ def generate_launch_description():
             description="Whether to activate the debug node",
         )
 
+        use_fusion = LaunchConfiguration("use_fusion")
+        use_fusion_cmd = DeclareLaunchArgument(
+            "use_fusion",
+            default_value="True",
+            description="Whether to activate YOLO-LiDAR fusion output",
+        )
+
         # get topics for remap
         detect_3d_detections_topic = "detections"
         debug_detections_topic = "detections"
@@ -298,6 +305,14 @@ def generate_launch_description():
             condition=IfCondition(PythonExpression([use_debug])),
         )
 
+        fusion_node_cmd = Node(
+            package="yolo_ros",
+            executable="fusion_node",
+            name="fusion_node",
+            namespace=namespace,
+            condition=IfCondition(PythonExpression([use_fusion])),
+        )
+
         return (
             model_type_cmd,
             model_cmd,
@@ -325,10 +340,12 @@ def generate_launch_description():
             depth_image_units_divisor_cmd,
             namespace_cmd,
             use_debug_cmd,
+            use_fusion_cmd,
             yolo_node_cmd,
             tracking_node_cmd,
             detect_3d_node_cmd,
             debug_node_cmd,
+            fusion_node_cmd,
         )
 
     use_tracking = LaunchConfiguration("use_tracking")
