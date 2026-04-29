@@ -9,6 +9,7 @@ import yaml
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from visualization_msgs.msg import Marker, MarkerArray
+from vision_msgs.msg import BoundingBox3D as VBBox3D, BoundingBox3DArray
 from yolo_msgs.msg import Detection, DetectionArray
 
 
@@ -26,6 +27,7 @@ class FusionNode(Node):
 
         self._pub = self.create_publisher(DetectionArray, self.fused_bbox_topic, 10)
         self._markers_pub = self.create_publisher(MarkerArray, "fused_bbox_markers", 10)
+        self._bbox3d_pub = self.create_publisher(BoundingBox3DArray, "~/fused_bbox_3d", 10)
 
         # Avoid strict timestamp sync because tracking and lidar projection may come
         # from different clock domains (bag time vs wall clock).
@@ -105,6 +107,22 @@ class FusionNode(Node):
 
         self._pub.publish(out)
         self._publish_markers(out)
+        self._publish_bbox3d(out)
+
+    def _publish_bbox3d(self, fused_msg: DetectionArray) -> None:
+        arr = BoundingBox3DArray()
+        arr.header = fused_msg.header
+        for det in fused_msg.detections:
+            b = VBBox3D()
+            b.center.position.x = det.bbox3d.center.position.x
+            b.center.position.y = det.bbox3d.center.position.y
+            b.center.position.z = det.bbox3d.center.position.z
+            b.center.orientation.w = 1.0
+            b.size.x = det.bbox3d.size.x
+            b.size.y = det.bbox3d.size.y
+            b.size.z = det.bbox3d.size.z
+            arr.boxes.append(b)
+        self._bbox3d_pub.publish(arr)
 
     def _publish_markers(self, fused_msg: DetectionArray) -> None:
         marker_array = MarkerArray()
