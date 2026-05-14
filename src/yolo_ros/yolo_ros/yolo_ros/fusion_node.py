@@ -36,6 +36,26 @@ class FusionNode(Node):
             f"Fusion node ready: tracking + {self.lidar_proj_topic} -> {self.fused_bbox_topic}"
         )
 
+    @staticmethod
+    def _foreground_points(px, py, pz):
+        if len(pz) < 2:
+            return px, py, pz
+
+        order = np.argsort(pz)
+        sz = pz[order]
+
+        diffs = np.diff(sz)
+        med = np.median(diffs)
+        mad = np.median(np.abs(diffs - med))
+        gap_thresh = max(med + 3.0 * mad, 0.05)
+
+        gaps = np.where(diffs > gap_thresh)[0]
+        if len(gaps) == 0:
+            return px, py, pz
+
+        fg = order[: gaps[0] + 1]
+        return px[fg], py[fg], pz[fg]
+
     def _detections_cb(self, detections_msg: DetectionArray) -> None:
         self._latest_detections_msg = detections_msg
 
@@ -77,9 +97,7 @@ class FusionNode(Node):
             if not np.any(mask):
                 continue
 
-            px = x[mask]
-            py = y[mask]
-            pz = z[mask]
+            px, py, pz = self._foreground_points(x[mask], y[mask], z[mask])
 
             fused_det = Detection()
             fused_det.class_id = det.class_id
