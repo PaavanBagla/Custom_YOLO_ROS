@@ -49,12 +49,20 @@ class FusionNode(Node):
         self.lidar_proj_topic = topic_config["topics"]["transform"]["lidar_2d_projection"]
         self.fused_bbox_topic = topic_config["topics"]["yolo"]["fused_bbox"]
 
-        # Half a 10Hz LiDAR period is the worst case for a dense buffer; the default
-        # leaves headroom for jitter and the occasional dropped scan without ever
-        # admitting a cloud from a neighbouring frame. Err tight here: a misplaced
-        # obstacle is worse than a dropped one, and the next detection is ~100ms away.
+        # Measured on the vehicle: tracking arrives 0.014s after its capture stamp while
+        # the projection arrives 0.031s after its own, so a detection is processed ~17ms
+        # BEFORE the cloud it should pair with has been buffered. Matching is therefore
+        # one-sided -- only backwards, into clouds already held -- and the worst case is a
+        # full 10Hz LiDAR period rather than the half period a two-sided nearest-neighbour
+        # search would give. The camera and LiDAR free-run on separate oscillators, so
+        # their phase sweeps that whole range with a ~60-100s beat; at 0.08 the node
+        # matched in long stretches and starved completely in others.
+        #
+        # 0.12 covers the full one-sided range with jitter headroom. The honest cost is
+        # that a pair may be up to 0.12s apart, ~0.6m at 5m/s. Buffering detections by
+        # ~50ms to restore two-sided matching would halve that; see the CHANGELOG.
         max_pairing_skew = float(
-            self.declare_parameter("max_pairing_skew", 0.08)
+            self.declare_parameter("max_pairing_skew", 0.12)
             .get_parameter_value()
             .double_value
         )

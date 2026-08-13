@@ -234,7 +234,10 @@ def generate_launch_description():
         max_pairing_skew = LaunchConfiguration("max_pairing_skew")
         max_pairing_skew_cmd = DeclareLaunchArgument(
             "max_pairing_skew",
-            default_value="0.08",
+            # 0.12, not 0.08: YOLO outruns the projection pipeline, so a detection is
+            # processed before its matching cloud is buffered and pairing is one-sided.
+            # The worst case is a full LiDAR period, not half. See fusion_node.py.
+            default_value="0.12",
             description=(
                 "Largest capture-time gap, in seconds, allowed between a detection array "
                 "and the buffered LiDAR projection it is fused with"
