@@ -136,13 +136,24 @@ class FusionNode(Node):
 
     @staticmethod
     def _foreground_points(px, py, pz):
-        if len(pz) < 2:
+        """Keep only the nearest depth cluster inside a bounding box.
+
+        Two objects that overlap in image space drop two separated groups of returns into
+        one bbox, and a median over both lands between them where nothing is. Sorting by
+        depth and cutting at the first significant gap keeps the foreground object alone.
+
+        Depth is ``px``: transform.py publishes x,y,z in the LiDAR frame, where x is
+        forward range (cropped to [0, 100]) and z is height (cropped to [-3.5, 1]).
+        Clustering on z instead splits by height, which on flat ground finds no gap at all
+        and lets the very blending this guards against through.
+        """
+        if len(px) < 2:
             return px, py, pz
 
-        order = np.argsort(pz)
-        sz = pz[order]
+        order = np.argsort(px)
+        sx = px[order]
 
-        diffs = np.diff(sz)
+        diffs = np.diff(sx)
         med = np.median(diffs)
         mad = np.median(np.abs(diffs - med))
         gap_thresh = max(med + 3.0 * mad, 0.05)
