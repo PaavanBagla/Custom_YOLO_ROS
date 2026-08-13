@@ -18,6 +18,7 @@ from launch import LaunchDescription, LaunchContext
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch.conditions import IfCondition
 
 
@@ -144,7 +145,10 @@ def generate_launch_description():
         input_image_topic = LaunchConfiguration("input_image_topic")
         input_image_topic_cmd = DeclareLaunchArgument(
             "input_image_topic",
-            default_value="/camera_fl/image_color",
+            default_value="/camera_fl/image",
+            # The raw driver topic, not image_proc's /camera_fl/image_color: that node
+            # runs a standing ~0.5s backlog. yolo_encoding defaults to bgr8, so
+            # cv_bridge debayers bayer_rggb8 here for a few ms of CPU instead.
             description="Name of the input image topic",
         )
 
@@ -219,6 +223,52 @@ def generate_launch_description():
             "use_fusion",
             default_value="True",
             description="Whether to activate YOLO-LiDAR fusion output",
+        )
+
+        # Each detection array is fused against the buffered LiDAR projection captured
+        # nearest to its own header stamp, so camera and inference latency delay *when* a
+        # 3D box appears without displacing *where* it lands. max_pairing_skew therefore
+        # only has to cover the LiDAR period and jitter, not the pipeline latency; raise
+        # projection_buffer_duration instead if detection latency ever exceeds it (the
+        # node logs which case it hit).
+        max_pairing_skew = LaunchConfiguration("max_pairing_skew")
+        max_pairing_skew_cmd = DeclareLaunchArgument(
+            "max_pairing_skew",
+            default_value="0.08",
+            description=(
+                "Largest capture-time gap, in seconds, allowed between a detection array "
+                "and the buffered LiDAR projection it is fused with"
+            ),
+        )
+
+        projection_buffer_duration = LaunchConfiguration("projection_buffer_duration")
+        projection_buffer_duration_cmd = DeclareLaunchArgument(
+            "projection_buffer_duration",
+            default_value="2.0",
+            description=(
+                "How much projection history, in seconds, to retain for matching. Must "
+                "exceed the camera-to-detection latency"
+            ),
+        )
+
+        fusion_timeout = LaunchConfiguration("fusion_timeout")
+        fusion_timeout_cmd = DeclareLaunchArgument(
+            "fusion_timeout",
+            default_value="0.5",
+            description=(
+                "Publish an empty fused array once detections have gone this long, in "
+                "seconds, without a refresh; 0 disables"
+            ),
+        )
+
+        projection_stamp_offset = LaunchConfiguration("projection_stamp_offset")
+        projection_stamp_offset_cmd = DeclareLaunchArgument(
+            "projection_stamp_offset",
+            default_value="0.0",
+            description=(
+                "Seconds added to each projection stamp for matching only; -0.05 centres "
+                "pairing on the LiDAR sweep instead of its end-of-sweep stamp"
+            ),
         )
 
         # get topics for remap
@@ -310,6 +360,20 @@ def generate_launch_description():
             executable="fusion_node",
             name="fusion_node",
             namespace=namespace,
+            # Substitutions resolve to strings, so the target type is declared explicitly
+            # -- otherwise the node rejects the override against its double declaration.
+            parameters=[{
+                "max_pairing_skew": ParameterValue(
+                    max_pairing_skew, value_type=float
+                ),
+                "projection_buffer_duration": ParameterValue(
+                    projection_buffer_duration, value_type=float
+                ),
+                "fusion_timeout": ParameterValue(fusion_timeout, value_type=float),
+                "projection_stamp_offset": ParameterValue(
+                    projection_stamp_offset, value_type=float
+                ),
+            }],
             condition=IfCondition(PythonExpression([use_fusion])),
         )
 
@@ -341,6 +405,10 @@ def generate_launch_description():
             namespace_cmd,
             use_debug_cmd,
             use_fusion_cmd,
+            max_pairing_skew_cmd,
+            projection_buffer_duration_cmd,
+            fusion_timeout_cmd,
+            projection_stamp_offset_cmd,
             yolo_node_cmd,
             tracking_node_cmd,
             detect_3d_node_cmd,

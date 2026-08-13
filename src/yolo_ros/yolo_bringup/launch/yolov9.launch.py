@@ -41,7 +41,7 @@ def generate_launch_description():
                     "enable": LaunchConfiguration("enable", default="True"),
                     "threshold": LaunchConfiguration("threshold", default="0.5"),
                     "input_image_topic": LaunchConfiguration(
-                        "input_image_topic", default="/camera_fl/image_color"
+                        "input_image_topic", default="/camera_fl/image"
                     ),
                     "image_reliability": LaunchConfiguration(
                         "image_reliability", default="1"
