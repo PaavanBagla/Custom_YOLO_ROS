@@ -47,6 +47,11 @@ def generate_launch_description():
                         "image_reliability", default="1"
                     ),
                     "namespace": LaunchConfiguration("namespace", default="yolo"),
+                    # Passed through explicitly so the default is visible here rather than
+                    # only leaking in from the included description.
+                    "use_sim_time": LaunchConfiguration(
+                        "use_sim_time", default="false"
+                    ),
                 }.items(),
             )
         ]

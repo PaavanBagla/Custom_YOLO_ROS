@@ -234,13 +234,34 @@ def generate_launch_description():
         max_pairing_skew = LaunchConfiguration("max_pairing_skew")
         max_pairing_skew_cmd = DeclareLaunchArgument(
             "max_pairing_skew",
-            # 0.12, not 0.08: YOLO outruns the projection pipeline, so a detection is
-            # processed before its matching cloud is buffered and pairing is one-sided.
-            # The worst case is a full LiDAR period, not half. See fusion_node.py.
-            default_value="0.12",
+            # 0.06 covers half a LiDAR period plus jitter. That is only reachable because
+            # wait_for_newer makes matching two-sided; YOLO outruns the projection pipeline,
+            # so a one-sided search would face a full period and need 0.12. See fusion_node.py.
+            default_value="0.06",
             description=(
                 "Largest capture-time gap, in seconds, allowed between a detection array "
                 "and the buffered LiDAR projection it is fused with"
+            ),
+        )
+
+        wait_for_newer = LaunchConfiguration("wait_for_newer")
+        wait_for_newer_cmd = DeclareLaunchArgument(
+            "wait_for_newer",
+            default_value="0.06",
+            description=(
+                "How long, in seconds, a detection may wait for a LiDAR projection captured "
+                "at or after it, instead of being matched backwards onto an older one. "
+                "0 restores one-sided matching"
+            ),
+        )
+
+        deferral_pump_period = LaunchConfiguration("deferral_pump_period")
+        deferral_pump_period_cmd = DeclareLaunchArgument(
+            "deferral_pump_period",
+            default_value="0.02",
+            description=(
+                "How often, in seconds, to retry deferred detections when the projection "
+                "stream has stalled. Read-only at runtime"
             ),
         )
 
@@ -262,6 +283,21 @@ def generate_launch_description():
                 "Publish an empty fused array once detections have gone this long, in "
                 "seconds, without a refresh; 0 disables"
             ),
+        )
+
+        # Live vehicle is the primary target, so sim time is off by default. Set
+        # use_sim_time:=true when replaying a bag with --clock. Stamp *pairing* compares two
+        # message stamps and does not depend on this, but the deferral expiry, the fusion
+        # watchdog and any TF lookup all read the node clock.
+        # Substitutions resolve to strings, so the target type is declared explicitly --
+        # otherwise the node rejects the override against its bool declaration.
+        use_sim_time_param = ParameterValue(
+            LaunchConfiguration("use_sim_time"), value_type=bool
+        )
+        use_sim_time_cmd = DeclareLaunchArgument(
+            "use_sim_time",
+            default_value="false",
+            description="Use /clock instead of wall time (set true for bag replay)",
         )
 
         projection_stamp_offset = LaunchConfiguration("projection_stamp_offset")
@@ -309,6 +345,7 @@ def generate_launch_description():
                     "agnostic_nms": agnostic_nms,
                     "retina_masks": retina_masks,
                     "image_reliability": image_reliability,
+                    "use_sim_time": use_sim_time_param,
                 }
             ],
             remappings=[("image_raw", input_image_topic)],
@@ -319,7 +356,11 @@ def generate_launch_description():
             executable="tracking_node",
             name="tracking_node",
             namespace=namespace,
-            parameters=[{"tracker": tracker, "image_reliability": image_reliability}],
+            parameters=[{
+                "tracker": tracker,
+                "image_reliability": image_reliability,
+                "use_sim_time": use_sim_time_param,
+            }],
             remappings=[("image_raw", input_image_topic)],
             condition=IfCondition(PythonExpression([str(use_tracking)])),
         )
@@ -335,6 +376,7 @@ def generate_launch_description():
                     "depth_image_units_divisor": depth_image_units_divisor,
                     "depth_image_reliability": depth_image_reliability,
                     "depth_info_reliability": depth_info_reliability,
+                    "use_sim_time": use_sim_time_param,
                 }
             ],
             remappings=[
@@ -350,7 +392,10 @@ def generate_launch_description():
             executable="debug_node",
             name="debug_node",
             namespace=namespace,
-            parameters=[{"image_reliability": image_reliability}],
+            parameters=[{
+                "image_reliability": image_reliability,
+                "use_sim_time": use_sim_time_param,
+            }],
             remappings=[
                 ("image_raw", input_image_topic),
                 ("detections", debug_detections_topic),
@@ -376,6 +421,11 @@ def generate_launch_description():
                 "projection_stamp_offset": ParameterValue(
                     projection_stamp_offset, value_type=float
                 ),
+                "wait_for_newer": ParameterValue(wait_for_newer, value_type=float),
+                "deferral_pump_period": ParameterValue(
+                    deferral_pump_period, value_type=float
+                ),
+                "use_sim_time": use_sim_time_param,
             }],
             condition=IfCondition(PythonExpression([use_fusion])),
         )
@@ -412,6 +462,9 @@ def generate_launch_description():
             projection_buffer_duration_cmd,
             fusion_timeout_cmd,
             projection_stamp_offset_cmd,
+            wait_for_newer_cmd,
+            deferral_pump_period_cmd,
+            use_sim_time_cmd,
             yolo_node_cmd,
             tracking_node_cmd,
             detect_3d_node_cmd,

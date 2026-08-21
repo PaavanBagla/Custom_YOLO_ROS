@@ -10,9 +10,15 @@ So the projections are buffered instead, and each detection array is fused again
 captured closest to its own header stamp. yolo_node and tracking_node both copy the source
 image header through untouched, so that stamp is the camera capture time, in the same host
 clock domain as the LiDAR. Skew drops to at most half a LiDAR period, independent of how far
-behind the camera pipeline runs. Stamps are only ever compared to each other and never to
-the node clock, which keeps this valid under bag replay without any use_sim_time
-configuration.
+behind the camera pipeline runs.
+
+Matching is two-sided: a detection with no cloud yet captured at or after it is deferred for
+up to wait_for_newer rather than forced backwards onto an older cloud. Deferred detections are
+resolved by _pump, which runs after every buffered cloud and on a short timer.
+
+Message stamps are only ever compared to each other, so the pairing itself is valid under bag
+replay regardless of use_sim_time. Deferral expiry and the watchdog do read the node clock, so
+run with use_sim_time:=true against a bag if you want them to track playback.
 
 Detections drive the output rather than projections: with a 10Hz cloud stream and an 80ms
 pairing bound, two consecutive clouds can match the same detection array, so a
@@ -20,13 +26,11 @@ projection-driven node would publish the same objects twice at two different geo
 one detector frame.
 """
 
-import time as _time
-
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 
 from ament_index_python.packages import get_package_share_directory
 import yaml
@@ -35,7 +39,11 @@ from sensor_msgs.msg import PointCloud2
 from visualization_msgs.msg import Marker, MarkerArray
 from yolo_msgs.msg import Detection, DetectionArray
 
-from perception_common.stamp_sync import StampMatchedBuffer, apply_bounded_parameters
+from perception_common.stamp_sync import (
+    DEFERRED,
+    StampMatchedBuffer,
+    apply_bounded_parameters,
+)
 
 
 class FusionNode(Node):
@@ -51,18 +59,20 @@ class FusionNode(Node):
 
         # Measured on the vehicle: tracking arrives 0.014s after its capture stamp while
         # the projection arrives 0.031s after its own, so a detection is processed ~17ms
-        # BEFORE the cloud it should pair with has been buffered. Matching is therefore
-        # one-sided -- only backwards, into clouds already held -- and the worst case is a
-        # full 10Hz LiDAR period rather than the half period a two-sided nearest-neighbour
-        # search would give. The camera and LiDAR free-run on separate oscillators, so
-        # their phase sweeps that whole range with a ~60-100s beat; at 0.08 the node
-        # matched in long stretches and starved completely in others.
+        # BEFORE the cloud it should pair with has been buffered. That is what makes
+        # wait_for_newer necessary: without it, matching can only reach backwards into
+        # clouds already held, and the worst case is a full 10Hz LiDAR period rather than
+        # the half period a two-sided search gives. The camera and LiDAR free-run on
+        # separate oscillators, so their phase sweeps that whole range with a ~60-100s
+        # beat; a one-sided node at 0.08 matched in long stretches and starved in others,
+        # and 0.12 was the width needed to cover the one-sided range.
         #
-        # 0.12 covers the full one-sided range with jitter headroom. The honest cost is
-        # that a pair may be up to 0.12s apart, ~0.6m at 5m/s. Buffering detections by
-        # ~50ms to restore two-sided matching would halve that; see the CHANGELOG.
+        # With deferral restoring two-sided matching, 0.06 covers half a period plus
+        # jitter, so a pair is at most ~0.3m apart at 5m/s. If this ever starves, set
+        # wait_for_newer to 0.0 and max_pairing_skew back to 0.12 at runtime -- that is
+        # exactly the old behaviour -- and check the unmatched/expired counters.
         max_pairing_skew = float(
-            self.declare_parameter("max_pairing_skew", 0.12)
+            self.declare_parameter("max_pairing_skew", 0.06)
             .get_parameter_value()
             .double_value
         )
@@ -89,16 +99,75 @@ class FusionNode(Node):
             .get_parameter_value()
             .double_value
         )
+        # How long a detection may wait for a cloud captured at or after it. This is what
+        # makes matching two-sided; see the max_pairing_skew comment above. Set to 0.0 to
+        # restore the old one-sided behaviour at runtime.
+        wait_for_newer = float(
+            self.declare_parameter("wait_for_newer", 0.06)
+            .get_parameter_value()
+            .double_value
+        )
+        # Deferrals are almost always resolved by the _pump that follows each buffered cloud;
+        # this timer only bounds the wait when the projection stream stalls. Read-only because
+        # a timer period cannot be changed after construction, and silently ignoring a
+        # ros2 param set would be worse than rejecting it.
+        pump_period = float(
+            self.declare_parameter(
+                "deferral_pump_period", 0.02, ParameterDescriptor(read_only=True)
+            )
+            .get_parameter_value()
+            .double_value
+        )
+        stats_log_period = float(
+            self.declare_parameter(
+                "stats_log_period", 5.0, ParameterDescriptor(read_only=True)
+            )
+            .get_parameter_value()
+            .double_value
+        )
+
+        # A 2D box around a distant vehicle also contains the road in front of it, caught
+        # by the box's bottom rows. Those returns are nearer than the vehicle, so the depth
+        # clustering below adopts them and the object is published several metres early.
+        # Measured on the 2026-08-20 bag: the published range sat 14.3m median (22.2m worst)
+        # in front of the vehicle's own returns, and the adopted points were at road height,
+        # pinned to the bottom 8% of the box. See _reject_ground for why each bound is here.
+        #
+        # Validated on that same replay by fitting the ground as a sloped line through each
+        # box's lowest quartile (these roads fall ~1.4cm per metre, so a flat threshold
+        # would have flattered the result) and measuring how far above it the points that
+        # decide the output sit. Before: median +0.00m, i.e. the road itself, with 1 of 32
+        # detections drawn from elevated returns. After: median +0.78m, vehicle-body
+        # height, with 30 of 32 from elevated returns. Median published range moved
+        # 76.05m -> 90.98m.
+        self._ground_min_range = float(
+            self.declare_parameter("ground_rejection_min_range", 25.0)
+            .get_parameter_value()
+            .double_value
+        )
+        self._ground_margin = float(
+            self.declare_parameter("ground_margin", 0.4)
+            .get_parameter_value()
+            .double_value
+        )
+        self._ground_min_points = int(
+            self.declare_parameter("ground_min_points", 2)
+            .get_parameter_value()
+            .integer_value
+        )
 
         self._projections = StampMatchedBuffer(
             "projection",
             buffer_duration=max(0.0, buffer_duration),
             max_skew=max(0.0, max_pairing_skew),
             stamp_offset=stamp_offset,
+            wait_for_newer=max(0.0, wait_for_newer),
         )
         self.fusion_timeout = max(0.0, self.fusion_timeout)
-        self._last_publish = 0.0
-        self._last_unmatched_log = 0.0
+        # None until the first publish: under sim time the node clock reads 0 until /clock
+        # arrives, and 0.0 here would make the first watchdog tick see a ~1.7e9s gap.
+        self._last_publish = None
+        self._last_unmatched_log = None
 
         self._pub = self.create_publisher(DetectionArray, self.fused_bbox_topic, 10)
         self._markers_pub = self.create_publisher(MarkerArray, "fused_bbox_markers", 10)
@@ -108,6 +177,10 @@ class FusionNode(Node):
 
         # Fixed period, so fusion_timeout is enforced to within 0.5s of granularity.
         self._watchdog_timer = self.create_timer(0.5, self._watchdog)
+        if pump_period > 0.0:
+            self._pump_timer = self.create_timer(pump_period, self._pump)
+        if stats_log_period > 0.0:
+            self._stats_timer = self.create_timer(stats_log_period, self._log_stats)
 
         # The pairing bound and the buffer depth both depend on measured pipeline latency,
         # so keep them settable at runtime for calibration against a replaying bag without
@@ -118,20 +191,52 @@ class FusionNode(Node):
             f"Fusion node ready: tracking + {self.lidar_proj_topic} -> {self.fused_bbox_topic}, "
             f"max_pairing_skew={self._projections.max_skew:.3f}s "
             f"projection_buffer_duration={self._projections.buffer_duration:.3f}s "
-            f"fusion_timeout={self.fusion_timeout:.3f}s (stamp-matched pairing)"
+            f"wait_for_newer={self._projections.wait_for_newer:.3f}s "
+            f"fusion_timeout={self.fusion_timeout:.3f}s "
+            f"ground_rejection>={self._ground_min_range:.1f}m "
+            f"ground_margin={self._ground_margin:.2f}m "
+            f"ground_min_points={self._ground_min_points} "
+            f"use_sim_time={self.get_parameter('use_sim_time').value} "
+            f"(stamp-matched pairing)"
         )
 
+    def _now(self) -> float:
+        """Seconds on the node clock -- sim time when use_sim_time is set, else wall time."""
+        return self.get_clock().now().nanoseconds * 1e-9
+
     def _on_set_parameters(self, params) -> SetParametersResult:
+        # Checked before anything is applied, so an out-of-range count cannot leave the
+        # node half-updated -- the same guarantee apply_bounded_parameters gives the rest.
+        for p in params:
+            if p.name == "ground_min_points" and int(p.value) < 0:
+                return SetParametersResult(
+                    successful=False, reason="ground_min_points must be >= 0"
+                )
+
         targets = {
             "max_pairing_skew": (self._projections, "max_skew"),
             "projection_buffer_duration": (self._projections, "buffer_duration"),
             "fusion_timeout": (self, "fusion_timeout"),
+            "wait_for_newer": (self._projections, "wait_for_newer"),
+            "ground_rejection_min_range": (self, "_ground_min_range"),
+            "ground_margin": (self, "_ground_margin"),
         }
+        # These two are metres; everything else here is seconds.
+        metres = {"ground_rejection_min_range", "ground_margin"}
         ok, reason, applied = apply_bounded_parameters(params, targets)
         if not ok:
             return SetParametersResult(successful=False, reason=reason)
         for name, value in applied:
-            self.get_logger().info(f"{name} set to {value:.3f}s")
+            self.get_logger().info(
+                f"{name} set to {value:.3f}{'m' if name in metres else 's'}"
+            )
+
+        for p in params:
+            if p.name == "ground_min_points":
+                self._ground_min_points = int(p.value)
+                self.get_logger().info(
+                    f"ground_min_points set to {self._ground_min_points}"
+                )
 
         # Unbounded: a negative offset is the expected direction for an end-of-sweep stamp.
         for p in params:
@@ -141,6 +246,54 @@ class FusionNode(Node):
                     f"projection_stamp_offset set to {float(p.value):.3f}s"
                 )
         return SetParametersResult(successful=True)
+
+    def _reject_ground(self, px, py, pz):
+        """Drop road returns from a box before the depth clustering runs.
+
+        The road in front of a distant vehicle falls inside its 2D box and is nearer than
+        the vehicle, so _foreground_points adopts it. The size of that error is set by how
+        far a pixel of box-edge error moves the ground intercept, which grows as
+        r^2/(f*h): 0.01m per pixel at 10m, 0.15m at 40m, 0.60m at 80m. That quadratic is
+        why near objects are placed correctly and far ones are not.
+
+        Hence the range gate rather than a height test alone. Below
+        ground_rejection_min_range the error is under a decimetre, while a short object --
+        a cone stands ~0.5m -- lies almost entirely within ground_margin of the road, so
+        filtering there would strip it for no benefit. Beyond the gate, a box left with
+        fewer than ground_min_points falls back to the unfiltered set, so a short or
+        sparsely-sampled object is never placed worse than it would have been.
+
+        Sensor geometry bounds what this can recover, and explains a transient that looks
+        like a bug but is not. The 32-ring LiDAR has a 1.29deg ring pitch, so ring spacing
+        at range r is r*tan(1.29deg): 0.45m at 20m, 0.90m at 40m, 1.80m at 80m. A 1.5m car
+        subtends less than one ring spacing beyond ~67m, so past that range whether any
+        ring lands on the vehicle at all is luck, frame to frame. On a frame where none
+        does, the box holds road and nothing else -- measured z-spread 0.03m across all 16
+        such detections on the 2026-08-20 replay -- ground_min_points declines to filter,
+        and the published range is the road ring in front of the vehicle, exactly as it was
+        before this function existed. That is why a distant object can sit on a ground ring
+        for several frames and then snap onto the vehicle as it closes to ~65m and the
+        rings begin to strike it. The split is not purely by range: on that replay the
+        filtered detections sat at 91.9m median and the fallback ones at 87.6m.
+
+        Known limitation: those no-return frames still publish a bbox3d, at the road
+        position, carrying no field that distinguishes them from a genuine fix. A near-zero
+        z-spread inside the box identifies them cheaply if a consumer ever needs to.
+        """
+        if len(px) < 2 or self._ground_margin <= 0.0:
+            return px, py, pz
+        # The nearest return decides, not the median: it is the one the clustering would
+        # adopt, so it is what determines whether this box is close enough to leave alone.
+        if float(np.min(px)) < self._ground_min_range:
+            return px, py, pz
+
+        # A low percentile rather than the minimum, so a single stray low return cannot
+        # drag the estimate down and quietly disable the margin.
+        ground_z = float(np.percentile(pz, 10.0))
+        keep = pz > ground_z + self._ground_margin
+        if int(np.count_nonzero(keep)) < self._ground_min_points:
+            return px, py, pz
+        return px[keep], py[keep], pz[keep]
 
     @staticmethod
     def _foreground_points(px, py, pz):
@@ -154,6 +307,13 @@ class FusionNode(Node):
         forward range (cropped to [0, 100]) and z is height (cropped to [-3.5, 1]).
         Clustering on z instead splits by height, which on flat ground finds no gap at all
         and lets the very blending this guards against through.
+
+        The road in front of a distant vehicle is a separate problem that this gap cut
+        cannot solve at any axis: the road is genuinely nearer, so the nearest cluster is
+        the correct answer to the question asked here, just not the wanted one. It is
+        handled upstream by _reject_ground, which strips near-ground returns before this
+        runs. Do not try to fix it by clustering on height again -- that reintroduces the
+        blending described above without addressing the road.
         """
         if len(px) < 2:
             return px, py, pz
@@ -174,27 +334,44 @@ class FusionNode(Node):
         return px[fg], py[fg], pz[fg]
 
     def _lidar_cb(self, lidar_msg: PointCloud2) -> None:
-        """Buffer the projection so a later detection array can be paired against it."""
+        """Buffer the projection, then release any detection that was waiting for it."""
         self._projections.add(lidar_msg)
+        # This is what resolves nearly every deferral, in the same tick the awaited cloud
+        # lands; the pump timer only matters when this stream stalls.
+        self._pump()
 
     def _detections_cb(self, detections_msg: DetectionArray) -> None:
-        entry, skew = self._projections.match(detections_msg.header)
-        if entry is None:
-            self._log_unmatched(skew)
-            return
-        self._fuse(detections_msg, entry)
+        pairing = self._projections.match(
+            detections_msg.header, now=self._now(), payload=detections_msg
+        )
+        if pairing.outcome is not DEFERRED:
+            self._complete(pairing)
 
-    def _log_unmatched(self, skew: float) -> None:
+    def _pump(self) -> None:
+        for pairing in self._projections.drain(self._now()):
+            self._complete(pairing)
+
+    def _complete(self, pairing) -> None:
+        if pairing.value is None:
+            self._log_unmatched(pairing.skew, pairing.reason)
+            return
+        self._fuse(pairing.payload, pairing.value)
+
+    def _log_unmatched(self, skew: float, reason=None) -> None:
         """Rate-limited warning so a starved or misaligned pipeline stays visible."""
-        now = _time.monotonic()
-        if now - self._last_unmatched_log < 1.0:
+        now = self._now()
+        if self._last_unmatched_log is not None and now - self._last_unmatched_log < 1.0:
             return
         self._last_unmatched_log = now
         self.get_logger().warning(
             f"Unmatched detections: "
-            f"{self._projections.describe_unmatched(skew, 'detection')}; "
+            f"{self._projections.describe_unmatched(skew, 'detection', reason=reason)}; "
             f"{self._projections.status()}"
         )
+
+    def _log_stats(self) -> None:
+        """Periodic pairing health, so a skew regression is visible without instrumentation."""
+        self.get_logger().info(f"pairing: {self._projections.status()}")
 
     def _fuse(self, detections_msg: DetectionArray, entry) -> None:
         xyz, u, v = entry.arrays()
@@ -227,7 +404,8 @@ class FusionNode(Node):
             if not np.any(mask):
                 continue
 
-            px, py, pz = self._foreground_points(x[mask], y[mask], z[mask])
+            bx, by, bz = self._reject_ground(x[mask], y[mask], z[mask])
+            px, py, pz = self._foreground_points(bx, by, bz)
 
             fused_det = Detection()
             fused_det.class_id = det.class_id
@@ -256,7 +434,7 @@ class FusionNode(Node):
     def _publish(self, fused_msg: DetectionArray) -> None:
         self._pub.publish(fused_msg)
         self._publish_markers(fused_msg)
-        self._last_publish = _time.monotonic()
+        self._last_publish = self._now()
 
     def _publish_markers(self, fused_msg: DetectionArray) -> None:
         marker_array = MarkerArray()
@@ -296,9 +474,9 @@ class FusionNode(Node):
         if self.fusion_timeout <= 0.0:
             return
         newest = self._projections.newest()
-        if newest is None:
+        if newest is None or self._last_publish is None:
             return
-        if _time.monotonic() - self._last_publish > self.fusion_timeout:
+        if self._now() - self._last_publish > self.fusion_timeout:
             empty = DetectionArray()
             empty.header = newest.header
             self._publish(empty)
