@@ -46,6 +46,101 @@ from perception_common.stamp_sync import (
 )
 
 
+def reject_ground(px, py, pz, *, min_range, margin, min_points):
+    """Drop road returns from a box before the depth clustering runs.
+
+    The road in front of a distant vehicle falls inside its 2D box and is nearer than
+    the vehicle, so foreground_points adopts it. The size of that error is set by how
+    far a pixel of box-edge error moves the ground intercept, which grows as
+    r^2/(f*h): 0.01m per pixel at 10m, 0.15m at 40m, 0.60m at 80m. That quadratic is
+    why near objects are placed correctly and far ones are not.
+
+    Hence the range gate rather than a height test alone. Below min_range the error is
+    under a decimetre, while a short object -- a cone stands ~0.5m -- lies almost
+    entirely within margin of the road, so filtering there would strip it for no
+    benefit. Beyond the gate, a box left with fewer than min_points falls back to the
+    unfiltered set, so a short or sparsely-sampled object is never placed worse than it
+    would have been.
+
+    Sensor geometry bounds what this can recover. The LiDAR is a VLP-32C, whose 32 beams
+    are deliberately NOT evenly pitched. Measured off the ring field of the 2026-08-20
+    bag: the pitch is 0.333deg across rings 9-25 (elevation -3.667deg to +1.667deg,
+    which is where anything past ~30m is imaged) and widens to as much as 9.36deg at the
+    extremes. This docstring previously used 1.29deg -- that is 40deg/31, the average
+    over the full FOV, and it is the wrong statistic for the band that matters. Ring
+    spacing at range r near the horizon is r*tan(0.333deg): 0.12m at 20m, 0.23m at 40m,
+    0.47m at 80m, 0.58m at 100m. A 1.5m car therefore still spans ~2.6 ring intervals at
+    100m, the far end of transform.py's crop.
+
+    That correction leaves an observation this docstring used to explain and no longer
+    does. On the 2026-08-20 replay, 16 detections held road and nothing else, with a
+    measured z-spread of 0.03m across all of them. The old explanation -- that past ~67m
+    whether any ring strikes the vehicle at all is luck -- is ruled out by the geometry
+    above. ground_min_points declines to filter those boxes, and the published range is
+    the road ring in front of the vehicle, exactly as it was before this function
+    existed. The cause is still unidentified: reflectivity dropout at the far end of the
+    sensor's range, occlusion, and box-edge error large enough to slide the whole box
+    down onto road are all still open. Do not re-derive a range threshold from the old
+    1.29deg number.
+
+    Known limitation: those no-return frames still publish a bbox3d, at the road
+    position, carrying no field that distinguishes them from a genuine fix. A near-zero
+    z-spread inside the box identifies them cheaply if a consumer ever needs to.
+    """
+    if len(px) < 2 or margin <= 0.0:
+        return px, py, pz
+    # The nearest return decides, not the median: it is the one the clustering would
+    # adopt, so it is what determines whether this box is close enough to leave alone.
+    if float(np.min(px)) < min_range:
+        return px, py, pz
+
+    # A low percentile rather than the minimum, so a single stray low return cannot
+    # drag the estimate down and quietly disable the margin.
+    ground_z = float(np.percentile(pz, 10.0))
+    keep = pz > ground_z + margin
+    if int(np.count_nonzero(keep)) < min_points:
+        return px, py, pz
+    return px[keep], py[keep], pz[keep]
+
+
+def foreground_points(px, py, pz):
+    """Keep only the nearest depth cluster inside a bounding box.
+
+    Two objects that overlap in image space drop two separated groups of returns into
+    one bbox, and a median over both lands between them where nothing is. Sorting by
+    depth and cutting at the first significant gap keeps the foreground object alone.
+
+    Depth is ``px``: transform.py publishes x,y,z in the LiDAR frame, where x is
+    forward range (cropped to [0, 100]) and z is height (cropped to [-3.5, 1]).
+    Clustering on z instead splits by height, which on flat ground finds no gap at all
+    and lets the very blending this guards against through.
+
+    The road in front of a distant vehicle is a separate problem that this gap cut
+    cannot solve at any axis: the road is genuinely nearer, so the nearest cluster is
+    the correct answer to the question asked here, just not the wanted one. It is
+    handled upstream by reject_ground, which strips near-ground returns before this
+    runs. Do not try to fix it by clustering on height again -- that reintroduces the
+    blending described above without addressing the road.
+    """
+    if len(px) < 2:
+        return px, py, pz
+
+    order = np.argsort(px)
+    sx = px[order]
+
+    diffs = np.diff(sx)
+    med = np.median(diffs)
+    mad = np.median(np.abs(diffs - med))
+    gap_thresh = max(med + 3.0 * mad, 0.05)
+
+    gaps = np.where(diffs > gap_thresh)[0]
+    if len(gaps) == 0:
+        return px, py, pz
+
+    fg = order[: gaps[0] + 1]
+    return px[fg], py[fg], pz[fg]
+
+
 class FusionNode(Node):
     def __init__(self) -> None:
         super().__init__("fusion_node")
@@ -248,90 +343,19 @@ class FusionNode(Node):
         return SetParametersResult(successful=True)
 
     def _reject_ground(self, px, py, pz):
-        """Drop road returns from a box before the depth clustering runs.
+        """The node's live thresholds applied to the module-level :func:`reject_ground`.
 
-        The road in front of a distant vehicle falls inside its 2D box and is nearer than
-        the vehicle, so _foreground_points adopts it. The size of that error is set by how
-        far a pixel of box-edge error moves the ground intercept, which grows as
-        r^2/(f*h): 0.01m per pixel at 10m, 0.15m at 40m, 0.60m at 80m. That quadratic is
-        why near objects are placed correctly and far ones are not.
-
-        Hence the range gate rather than a height test alone. Below
-        ground_rejection_min_range the error is under a decimetre, while a short object --
-        a cone stands ~0.5m -- lies almost entirely within ground_margin of the road, so
-        filtering there would strip it for no benefit. Beyond the gate, a box left with
-        fewer than ground_min_points falls back to the unfiltered set, so a short or
-        sparsely-sampled object is never placed worse than it would have been.
-
-        Sensor geometry bounds what this can recover, and explains a transient that looks
-        like a bug but is not. The 32-ring LiDAR has a 1.29deg ring pitch, so ring spacing
-        at range r is r*tan(1.29deg): 0.45m at 20m, 0.90m at 40m, 1.80m at 80m. A 1.5m car
-        subtends less than one ring spacing beyond ~67m, so past that range whether any
-        ring lands on the vehicle at all is luck, frame to frame. On a frame where none
-        does, the box holds road and nothing else -- measured z-spread 0.03m across all 16
-        such detections on the 2026-08-20 replay -- ground_min_points declines to filter,
-        and the published range is the road ring in front of the vehicle, exactly as it was
-        before this function existed. That is why a distant object can sit on a ground ring
-        for several frames and then snap onto the vehicle as it closes to ~65m and the
-        rings begin to strike it. The split is not purely by range: on that replay the
-        filtered detections sat at 91.9m median and the fallback ones at 87.6m.
-
-        Known limitation: those no-return frames still publish a bbox3d, at the road
-        position, carrying no field that distinguishes them from a genuine fix. A near-zero
-        z-spread inside the box identifies them cheaply if a consumer ever needs to.
+        The rule itself lives at module scope so the offline A/B harness
+        (``scripts/patch_ab.py``) runs literally this code rather than a copy that drifts.
         """
-        if len(px) < 2 or self._ground_margin <= 0.0:
-            return px, py, pz
-        # The nearest return decides, not the median: it is the one the clustering would
-        # adopt, so it is what determines whether this box is close enough to leave alone.
-        if float(np.min(px)) < self._ground_min_range:
-            return px, py, pz
-
-        # A low percentile rather than the minimum, so a single stray low return cannot
-        # drag the estimate down and quietly disable the margin.
-        ground_z = float(np.percentile(pz, 10.0))
-        keep = pz > ground_z + self._ground_margin
-        if int(np.count_nonzero(keep)) < self._ground_min_points:
-            return px, py, pz
-        return px[keep], py[keep], pz[keep]
-
-    @staticmethod
-    def _foreground_points(px, py, pz):
-        """Keep only the nearest depth cluster inside a bounding box.
-
-        Two objects that overlap in image space drop two separated groups of returns into
-        one bbox, and a median over both lands between them where nothing is. Sorting by
-        depth and cutting at the first significant gap keeps the foreground object alone.
-
-        Depth is ``px``: transform.py publishes x,y,z in the LiDAR frame, where x is
-        forward range (cropped to [0, 100]) and z is height (cropped to [-3.5, 1]).
-        Clustering on z instead splits by height, which on flat ground finds no gap at all
-        and lets the very blending this guards against through.
-
-        The road in front of a distant vehicle is a separate problem that this gap cut
-        cannot solve at any axis: the road is genuinely nearer, so the nearest cluster is
-        the correct answer to the question asked here, just not the wanted one. It is
-        handled upstream by _reject_ground, which strips near-ground returns before this
-        runs. Do not try to fix it by clustering on height again -- that reintroduces the
-        blending described above without addressing the road.
-        """
-        if len(px) < 2:
-            return px, py, pz
-
-        order = np.argsort(px)
-        sx = px[order]
-
-        diffs = np.diff(sx)
-        med = np.median(diffs)
-        mad = np.median(np.abs(diffs - med))
-        gap_thresh = max(med + 3.0 * mad, 0.05)
-
-        gaps = np.where(diffs > gap_thresh)[0]
-        if len(gaps) == 0:
-            return px, py, pz
-
-        fg = order[: gaps[0] + 1]
-        return px[fg], py[fg], pz[fg]
+        return reject_ground(
+            px,
+            py,
+            pz,
+            min_range=self._ground_min_range,
+            margin=self._ground_margin,
+            min_points=self._ground_min_points,
+        )
 
     def _lidar_cb(self, lidar_msg: PointCloud2) -> None:
         """Buffer the projection, then release any detection that was waiting for it."""
@@ -405,7 +429,7 @@ class FusionNode(Node):
                 continue
 
             bx, by, bz = self._reject_ground(x[mask], y[mask], z[mask])
-            px, py, pz = self._foreground_points(bx, by, bz)
+            px, py, pz = foreground_points(bx, by, bz)
 
             fused_det = Detection()
             fused_det.class_id = det.class_id
