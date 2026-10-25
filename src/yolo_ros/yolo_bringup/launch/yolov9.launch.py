@@ -40,6 +40,12 @@ def generate_launch_description():
                     "device": LaunchConfiguration("device", default="cuda:0"),
                     "enable": LaunchConfiguration("enable", default="True"),
                     "threshold": LaunchConfiguration("threshold", default="0.5"),
+                    # Inference size; boxes come back in full-image pixels whatever it is, so the
+                    # camera/LiDAR calibration downstream is unaffected. The container sets 960x1280
+                    # (docker-compose.yml, YOLO_IMGSZ_*): a standing person is then detected from
+                    # ~90 m instead of ~80 m (camera_range_20261022_095918).
+                    "imgsz_height": LaunchConfiguration("imgsz_height", default="480"),
+                    "imgsz_width": LaunchConfiguration("imgsz_width", default="640"),
                     "input_image_topic": LaunchConfiguration(
                         "input_image_topic", default="/camera_fl/image"
                     ),
